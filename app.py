@@ -1,651 +1,561 @@
+# app.py
 import os
 import json
-import uuid
-from datetime import date, datetime, timedelta
+import time
+import random
+from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
-import pandas as pd
 
 # OpenAI 최신 SDK
 from openai import OpenAI
 
-# ---------------------------
+
+# =========================
 # 기본 설정
-# ---------------------------
+# =========================
 st.set_page_config(
-    page_title="AI Habit Tracker",
-    page_icon="✅",
-    layout="wide"
+    page_title="AI 습관 트래커",
+    page_icon="📊",
+    layout="wide",
 )
 
-DATA_DIR = "data"
-HABITS_FILE = os.path.join(DATA_DIR, "habits.json")
-LOGS_FILE = os.path.join(DATA_DIR, "logs.json")
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+st.title("📊 AI 습관 트래커")
+st.caption("오늘의 습관 + 기분 + 날씨 + 강아지(??)를 모아서 AI 코치 리포트를 만들어줘요 🐶")
 
 
-# ---------------------------
-# 유틸: 파일/데이터 로드/저장
-# ---------------------------
-def ensure_data_dir():
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
+# =========================
+# 유틸 함수
+# =========================
+def safe_pct(x, total):
+    if total <= 0:
+        return 0
+    return int(round((x / total) * 100, 0))
 
 
-def load_json(path, default):
-    ensure_data_dir()
-    if not os.path.exists(path):
-        return default
+def _timeout_get(url, params=None, headers=None, timeout=10):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
     except Exception:
-        return default
+        return None
 
 
-def save_json(path, data):
-    ensure_data_dir()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def load_habits():
-    return load_json(HABITS_FILE, [])
-
-
-def load_logs():
-    return load_json(LOGS_FILE, [])
-
-
-def load_settings():
-    return load_json(SETTINGS_FILE, {"city": "Seoul", "coach_tone": "다정한 코치"})
-
-
-def save_habits(habits):
-    save_json(HABITS_FILE, habits)
-
-
-def save_logs(logs):
-    save_json(LOGS_FILE, logs)
-
-
-def save_settings(settings):
-    save_json(SETTINGS_FILE, settings)
-
-
-# ---------------------------
-# 유틸: 날짜 처리
-# ---------------------------
-def today_str():
-    return date.today().isoformat()
-
-
-def last_n_days(n=7):
-    return [(date.today() - timedelta(days=i)).isoformat() for i in range(n)][::-1]
-
-
-# ---------------------------
-# 로그/체크 처리
-# ---------------------------
-def get_log_map_for_date(logs, target_date):
+# =========================
+# API 연동 함수
+# =========================
+def get_weather(city: str, api_key: str):
     """
-    {habit_id: checked_bool}
+    OpenWeatherMap 현재 날씨 조회.
+    - 한국어
+    - 섭씨
+    실패 시 None 반환
     """
-    m = {}
-    for r in logs:
-        if r["date"] == target_date:
-            m[r["habit_id"]] = r["checked"]
-    return m
-
-
-def upsert_log(logs, target_date, habit_id, checked):
-    # 있으면 수정, 없으면 추가
-    for r in logs:
-        if r["date"] == target_date and r["habit_id"] == habit_id:
-            r["checked"] = checked
-            return logs
-    logs.append({"date": target_date, "habit_id": habit_id, "checked": checked})
-    return logs
-
-
-# ---------------------------
-# 통계 계산
-# ---------------------------
-def calc_streak(logs, habit_id):
-    """
-    오늘부터 거꾸로 연속 체크 streak 계산
-    """
-    logs_map = {(r["date"], r["habit_id"]): r["checked"] for r in logs}
-    streak = 0
-    d = date.today()
-    while True:
-        key = (d.isoformat(), habit_id)
-        if logs_map.get(key, False):
-            streak += 1
-            d -= timedelta(days=1)
-        else:
-            break
-    return streak
-
-
-def calc_7day_success_rate(logs, habits):
-    """
-    최근 7일 기준 전체 체크율 (습관 수 대비)
-    """
-    days = last_n_days(7)
-    if len(habits) == 0:
-        return 0.0
-
-    logs_map = {(r["date"], r["habit_id"]): r["checked"] for r in logs}
-
-    total = len(days) * len(habits)
-    done = 0
-    for d in days:
-        for h in habits:
-            if logs_map.get((d, h["id"]), False):
-                done += 1
-    return done / total
-
-
-def calc_daily_progress(logs, habits, target_date):
-    """
-    오늘 체크 진행률 (done/total)
-    """
-    if len(habits) == 0:
-        return (0, 0)
-
-    m = get_log_map_for_date(logs, target_date)
-    done = sum([1 for h in habits if m.get(h["id"], False)])
-    return done, len(habits)
-
-
-def habit_success_rate_7days(logs, habit_id):
-    days = last_n_days(7)
-    logs_map = {(r["date"], r["habit_id"]): r["checked"] for r in logs}
-    total = len(days)
-    done = sum([1 for d in days if logs_map.get((d, habit_id), False)])
-    return done / total if total > 0 else 0.0
-
-
-# ---------------------------
-# API: 날씨 (OpenWeatherMap)
-# ---------------------------
-@st.cache_data(ttl=60 * 60 * 6)  # 6시간 캐시
-def fetch_weather(city, api_key):
     if not api_key:
         return None
 
     url = "https://api.openweathermap.org/data/2.5/weather"
-    params = {"q": city, "appid": api_key, "units": "metric", "lang": "kr"}
-
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-
-    return {
-        "city": city,
-        "temp": data["main"]["temp"],
-        "feels_like": data["main"]["feels_like"],
-        "weather": data["weather"][0]["description"],
-        "main": data["weather"][0]["main"],
+    params = {
+        "q": city,
+        "appid": api_key,
+        "units": "metric",
+        "lang": "kr",
     }
 
-
-# ---------------------------
-# API: 강아지 이미지 (Dog API)
-# ---------------------------
-def fetch_dog_image():
-    url = "https://dog.ceo/api/breeds/image/random"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    return data["message"]
-
-
-# ---------------------------
-# API: OpenAI (코치/추천)
-# ---------------------------
-def openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    data = _timeout_get(url, params=params, timeout=10)
+    if not data:
         return None
-    return OpenAI(api_key=api_key)
-
-
-def generate_ai_message(prompt, temperature=0.7):
-    client = openai_client()
-    if not client:
-        return "⚠️ OPENAI_API_KEY가 설정되지 않았어요. 설정 후 다시 시도해줘!"
 
     try:
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "너는 습관 트래커 앱의 AI 코치야. 한국어로 친절하고 실용적으로 답해."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
+        weather_desc = data["weather"][0]["description"]
+        temp = data["main"]["temp"]
+        feels_like = data["main"]["feels_like"]
+        humidity = data["main"]["humidity"]
+        wind = data.get("wind", {}).get("speed", None)
+
+        return {
+            "city": city,
+            "description": weather_desc,
+            "temp_c": float(temp),
+            "feels_like_c": float(feels_like),
+            "humidity": int(humidity),
+            "wind_mps": wind,
+        }
+    except Exception:
+        return None
+
+
+def get_dog_image():
+    """
+    Dog CEO API에서 랜덤 강아지 사진 URL + 품종 가져오기
+    실패 시 None 반환
+    """
+    url = "https://dog.ceo/api/breeds/image/random"
+    data = _timeout_get(url, timeout=10)
+    if not data:
+        return None
+
+    try:
+        image_url = data["message"]
+        # 예: https://images.dog.ceo/breeds/hound-afghan/n02088094_1003.jpg
+        # 품종 추출: breeds/다음 폴더명
+        breed = "unknown"
+        if "/breeds/" in image_url:
+            part = image_url.split("/breeds/")[1].split("/")[0]
+            # hound-afghan 같은 케이스
+            breed = part.replace("-", " ")
+        return {"image_url": image_url, "breed": breed}
+    except Exception:
+        return None
+
+
+# =========================
+# AI 리포트 생성
+# =========================
+SYSTEM_PROMPTS = {
+    "스파르타 코치": """너는 매우 엄격하고 현실적인 스파르타 코치다.
+말투는 짧고 단호하며 변명은 허용하지 않는다.
+하지만 공격적이거나 모욕적이면 안 된다. 냉정한 격려를 한다.""",
+    "따뜻한 멘토": """너는 따뜻하고 다정한 멘토다.
+사용자를 존중하고 공감하며, 작은 성취도 크게 인정해준다.
+부드럽고 실용적인 조언을 준다.""",
+    "게임 마스터": """너는 RPG 세계관의 게임 마스터다.
+사용자는 플레이어이며, 습관은 퀘스트다.
+날씨/기분/습관을 게임 요소로 해석해서 재미있게 말한다.
+오글거림은 살짝 허용하지만 너무 길면 안 된다.""",
+}
+
+OUTPUT_FORMAT_GUIDE = """
+출력은 반드시 아래 형식을 지켜라.
+
+[컨디션 등급] S/A/B/C/D (딱 1개)
+
+[습관 분석]
+- (핵심 요약 3줄 이내)
+- 달성한 습관과 놓친 습관을 구분해서 말해라.
+
+[날씨 코멘트]
+- 날씨가 있으면: 날씨 기반 조언 1~2문장
+- 없으면: "날씨 정보 없음"이라고만 적어라.
+
+[내일 미션]
+- 구체적인 미션 3개 (체크박스 습관과 연결)
+
+[오늘의 한마디]
+- 한 문장
+"""
+
+def generate_report(
+    openai_api_key: str,
+    coach_style: str,
+    habits_checked: list,
+    habits_missed: list,
+    mood: int,
+    achievement_pct: int,
+    weather: dict | None,
+    dog: dict | None,
+):
+    """
+    습관+기분+날씨+강아지 품종을 모아서 OpenAI에 전달
+    모델: gpt-5-mini
+    실패 시 None 반환
+    """
+    if not openai_api_key:
+        return None
+
+    system_prompt = SYSTEM_PROMPTS.get(coach_style, SYSTEM_PROMPTS["따뜻한 멘토"])
+
+    weather_text = "날씨 정보 없음"
+    if weather:
+        wind_txt = f"{weather['wind_mps']}m/s" if weather.get("wind_mps") is not None else "정보 없음"
+        weather_text = (
+            f"- 도시: {weather['city']}\n"
+            f"- 날씨: {weather['description']}\n"
+            f"- 기온: {weather['temp_c']:.1f}°C (체감 {weather['feels_like_c']:.1f}°C)\n"
+            f"- 습도: {weather['humidity']}%\n"
+            f"- 바람: {wind_txt}"
         )
-        return res.choices[0].message.content
-    except Exception as e:
-        return f"⚠️ OpenAI 호출 중 오류가 발생했어요: {e}"
 
+    dog_text = "강아지 정보 없음"
+    if dog:
+        dog_text = f"- 품종(추정): {dog.get('breed','unknown')}"
 
-def build_coach_prompt(settings, habits, logs, target_date):
-    tone = settings.get("coach_tone", "다정한 코치")
+    user_prompt = f"""
+오늘의 체크인 데이터는 다음과 같다.
 
-    log_map = get_log_map_for_date(logs, target_date)
-    checked = [h["name"] for h in habits if log_map.get(h["id"], False)]
-    unchecked = [h["name"] for h in habits if not log_map.get(h["id"], False)]
+[습관]
+- 달성: {", ".join(habits_checked) if habits_checked else "없음"}
+- 미달성: {", ".join(habits_missed) if habits_missed else "없음"}
+- 달성률: {achievement_pct}%
 
-    # streak + 7일 성공률
-    streak_info = []
-    for h in habits:
-        s = calc_streak(logs, h["id"])
-        rate = habit_success_rate_7days(logs, h["id"])
-        streak_info.append(f"- {h['name']}: streak={s}일, 최근7일 성공률={int(rate*100)}%")
+[기분]
+- 점수: {mood}/10
 
-    return f"""
-너는 습관 트래커 앱의 AI 코치야.
-코치 톤은 '{tone}' 스타일로 해줘.
+[날씨]
+{weather_text}
 
-오늘 날짜: {target_date}
-
-[오늘 체크 완료한 습관]
-{checked if checked else ["없음"]}
-
-[오늘 체크 실패한 습관]
-{unchecked if unchecked else ["없음"]}
-
-[습관별 상태]
-{chr(10).join(streak_info)}
+[강아지]
+{dog_text}
 
 요구사항:
-1) 오늘 잘한 점 2~3개 (구체적으로)
-2) 체크 못한 습관이 있다면 현실적인 조언 2개
-3) 내일을 위한 '한 줄 미션' 1개
-4) 너무 길지 않게, 보기 좋게 bullet로 정리
-"""
+- 과장하지 말고 현실적인 조언을 해라.
+- 너무 길지 않게, 총 12~18줄 정도로 작성해라.
+- 사용자가 오늘 바로 행동을 바꿀 수 있게 구체적으로 말해라.
 
+{OUTPUT_FORMAT_GUIDE}
+""".strip()
 
-def build_weather_prompt(weather):
-    return f"""
-너는 습관 트래커 앱의 AI 코치야.
-오늘 날씨를 보고 사용자가 습관을 더 잘 지킬 수 있도록 추천해줘.
+    try:
+        client = OpenAI(api_key=openai_api_key)
 
-도시: {weather['city']}
-현재 기온: {weather['temp']}°C
-체감 온도: {weather['feels_like']}°C
-날씨 설명: {weather['weather']}
-날씨 상태(main): {weather['main']}
-
-출력 형식:
-- 오늘 날씨 한 줄 요약
-- 날씨 기반 습관 추천 3개 (실천 가능한 수준으로)
-- 마지막에 동기부여 한 줄
-한국어로, 너무 과장하지 말고 현실적으로.
-"""
-
-
-# ---------------------------
-# UI 컴포넌트
-# ---------------------------
-def render_header():
-    st.markdown(
-        """
-        <div style="padding: 0.5rem 0; margin-bottom: 0.5rem;">
-            <h1 style="margin:0;">✅ AI Habit Tracker</h1>
-            <p style="margin:0; opacity:0.7;">OpenAI + Weather + Dog Rewards</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def sidebar(settings):
-    st.sidebar.title("🐶 메뉴")
-
-    page = st.sidebar.radio(
-        "이동",
-        ["🏠 홈", "✅ 오늘 체크", "📊 통계", "➕ 습관 관리", "⚙️ 설정"],
-        index=0,
-    )
-
-    st.sidebar.divider()
-    st.sidebar.subheader("⚙️ 빠른 설정")
-
-    city = st.sidebar.text_input("도시", value=settings.get("city", "Seoul"))
-    tone = st.sidebar.selectbox(
-        "코치 톤",
-        ["다정한 코치", "엄격한 코치", "친구 같은 코치"],
-        index=["다정한 코치", "엄격한 코치", "친구 같은 코치"].index(settings.get("coach_tone", "다정한 코치")),
-    )
-
-    settings["city"] = city
-    settings["coach_tone"] = tone
-    save_settings(settings)
-
-    st.sidebar.divider()
-
-    if st.sidebar.button("🧨 데이터 초기화", use_container_width=True):
-        save_habits([])
-        save_logs([])
-        save_settings({"city": "Seoul", "coach_tone": "다정한 코치"})
-        st.sidebar.success("초기화 완료! 새로고침하면 반영돼요.")
-
-    return page
-
-
-# ---------------------------
-# 페이지: 홈
-# ---------------------------
-def page_home(habits, logs, settings):
-    st.subheader(f"📅 오늘: {date.today().strftime('%Y-%m-%d (%a)')}")
-
-    done, total = calc_daily_progress(logs, habits, today_str())
-    progress_ratio = (done / total) if total > 0 else 0.0
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric("오늘 체크 진행률", f"{done}/{total}")
-
-        st.progress(progress_ratio)
-
-    with col2:
-        st.markdown("### 🌦️ 현재 날씨")
-        weather_key = os.getenv("OPENWEATHER_API_KEY")
-        try:
-            w = fetch_weather(settings.get("city", "Seoul"), weather_key)
-            if w:
-                st.write(f"**{w['city']}**")
-                st.write(f"🌡️ {w['temp']}°C (체감 {w['feels_like']}°C)")
-                st.write(f"☁️ {w['weather']}")
-            else:
-                st.info("OPENWEATHER_API_KEY가 없어서 날씨를 못 불러왔어요.")
-        except Exception as e:
-            st.warning(f"날씨 불러오기 실패: {e}")
-
-    with col3:
-        st.markdown("### 💬 오늘의 AI 한마디")
-
-        prompt = f"""
-너는 습관 트래커 앱의 AI 코치야.
-사용자가 앱을 열었을 때 오늘 하루를 시작하기 좋은 한마디를 해줘.
-코치 톤: {settings.get('coach_tone', '다정한 코치')}
-너무 길지 않게 2~3문장.
-"""
-        msg = generate_ai_message(prompt, temperature=0.8)
-        st.write(msg)
-
-
-# ---------------------------
-# 페이지: 오늘 체크
-# ---------------------------
-def page_daily_checkin(habits, logs, settings):
-    st.subheader("✅ 오늘 체크")
-
-    if len(habits) == 0:
-        st.info("아직 습관이 없어요! ➕ 습관 관리에서 먼저 추가해줘.")
-        return
-
-    target_date = today_str()
-    log_map = get_log_map_for_date(logs, target_date)
-
-    st.write("오늘 수행한 습관을 체크해줘!")
-
-    checked_state = {}
-    for h in habits:
-        checked_state[h["id"]] = st.checkbox(
-            f"{h['name']}  ·  ({h.get('category','기타')})",
-            value=log_map.get(h["id"], False),
+        res = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
         )
+        return res.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+
+# =========================
+# 사이드바: API 키 입력
+# =========================
+with st.sidebar:
+    st.header("🔑 API 설정")
+
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="AI 코치 리포트를 만들 때 필요해요.",
+    )
+
+    weather_api_key = st.text_input(
+        "OpenWeatherMap API Key",
+        type="password",
+        placeholder="OpenWeatherMap key",
+        help="날씨 정보를 가져올 때 필요해요.",
+    )
 
     st.divider()
-
-    if st.button("💾 오늘 체크 저장", use_container_width=True):
-        for hid, checked in checked_state.items():
-            logs = upsert_log(logs, target_date, hid, checked)
-
-        save_logs(logs)
-        st.success("저장 완료! 🎉")
-
-        # 저장 후 결과 출력
-        done, total = calc_daily_progress(logs, habits, target_date)
-
-        st.divider()
-        st.subheader("🐶 오늘의 보상")
-
-        # 강아지 이미지 개수 룰
-        dog_count = 0
-        if done >= 5:
-            dog_count = 3
-        elif done >= 3:
-            dog_count = 2
-        elif done >= 1:
-            dog_count = 1
-
-        if dog_count == 0:
-            st.info("오늘은 체크한 습관이 없어서 강아지가 못 나와요 🥲")
-        else:
-            cols = st.columns(dog_count)
-            for i in range(dog_count):
-                try:
-                    img = fetch_dog_image()
-                    with cols[i]:
-                        st.image(img, use_container_width=True)
-                except Exception as e:
-                    st.warning(f"강아지 이미지 불러오기 실패: {e}")
-
-        st.divider()
-        st.subheader("🧠 AI 코치 피드백")
-        coach_prompt = build_coach_prompt(settings, habits, logs, target_date)
-        coach_msg = generate_ai_message(coach_prompt, temperature=0.7)
-        st.write(coach_msg)
-
-        st.divider()
-        st.subheader("🌦️ 날씨 기반 추천")
-
-        weather_key = os.getenv("OPENWEATHER_API_KEY")
-        try:
-            w = fetch_weather(settings.get("city", "Seoul"), weather_key)
-            if w:
-                st.caption(f"{w['city']} · {w['temp']}°C · {w['weather']}")
-                weather_prompt = build_weather_prompt(w)
-                weather_msg = generate_ai_message(weather_prompt, temperature=0.7)
-                st.write(weather_msg)
-            else:
-                st.info("OPENWEATHER_API_KEY가 없어서 날씨 추천을 못 만들어요.")
-        except Exception as e:
-            st.warning(f"날씨 추천 생성 실패: {e}")
+    st.caption("⚙️ 팁: 키가 없으면 앱은 동작하지만, 날씨/AI 리포트는 제한돼요.")
 
 
-# ---------------------------
-# 페이지: 통계
-# ---------------------------
-def page_stats(habits, logs):
-    st.subheader("📊 통계")
+# =========================
+# 세션 상태 초기화
+# =========================
+HABITS = [
+    ("🌅", "기상 미션"),
+    ("💧", "물 마시기"),
+    ("📚", "공부/독서"),
+    ("🏃", "운동하기"),
+    ("😴", "수면"),
+]
 
-    if len(habits) == 0:
-        st.info("습관이 없어서 통계를 낼 수 없어요. 먼저 습관을 추가해줘!")
+CITY_LIST = [
+    "Seoul",
+    "Busan",
+    "Incheon",
+    "Daegu",
+    "Daejeon",
+    "Gwangju",
+    "Suwon",
+    "Ulsan",
+    "Jeju",
+    "Changwon",
+]
+
+COACH_STYLES = ["스파르타 코치", "따뜻한 멘토", "게임 마스터"]
+
+if "history" not in st.session_state:
+    st.session_state.history = []  # list of dict: {date, pct, mood, checked_count}
+
+if "today_saved" not in st.session_state:
+    st.session_state.today_saved = False
+
+if "last_report" not in st.session_state:
+    st.session_state.last_report = None
+
+if "last_weather" not in st.session_state:
+    st.session_state.last_weather = None
+
+if "last_dog" not in st.session_state:
+    st.session_state.last_dog = None
+
+
+# =========================
+# 데모용 6일 샘플 데이터 (초기 1회만)
+# =========================
+def init_demo_history_if_empty():
+    if st.session_state.history:
         return
 
-    # 최근 7일 전체 체크율
-    rate = calc_7day_success_rate(logs, habits)
-    st.metric("최근 7일 전체 체크율", f"{int(rate * 100)}%")
+    # 최근 6일 샘플
+    today = datetime.now().date()
+    base = today - timedelta(days=6)
 
-    st.divider()
-
-    # 최근 7일 날짜별 체크 수
-    days = last_n_days(7)
-    logs_map = {(r["date"], r["habit_id"]): r["checked"] for r in logs}
-
-    daily_done = []
-    for d in days:
-        done = sum([1 for h in habits if logs_map.get((d, h["id"]), False)])
-        daily_done.append({"date": d, "done": done})
-
-    df_daily = pd.DataFrame(daily_done)
-    st.markdown("### 📈 최근 7일 체크 추이")
-    st.line_chart(df_daily.set_index("date"))
-
-    st.divider()
-
-    # 습관별 streak + 성공률
-    rows = []
-    for h in habits:
-        s = calc_streak(logs, h["id"])
-        r = habit_success_rate_7days(logs, h["id"])
-        rows.append(
+    demo = []
+    for i in range(6):
+        d = base + timedelta(days=i)
+        checked = random.randint(1, 5)
+        mood = random.randint(4, 9)
+        pct = safe_pct(checked, 5)
+        demo.append(
             {
-                "습관": h["name"],
-                "카테고리": h.get("category", "기타"),
-                "streak(일)": s,
-                "최근7일 성공률": f"{int(r * 100)}%",
+                "date": d.isoformat(),
+                "pct": pct,
+                "mood": mood,
+                "checked_count": checked,
+            }
+        )
+    st.session_state.history = demo
+
+
+init_demo_history_if_empty()
+
+
+# =========================
+# UI: 체크인
+# =========================
+st.subheader("✅ 오늘의 습관 체크인")
+
+colA, colB = st.columns([1.2, 1.0], gap="large")
+
+with colA:
+    st.markdown("#### 🧾 습관 체크")
+
+    # 2열 배치
+    left, right = st.columns(2, gap="medium")
+
+    # 체크 상태 저장용 dict
+    checked_map = {}
+
+    for idx, (emoji, name) in enumerate(HABITS):
+        target_col = left if idx % 2 == 0 else right
+        with target_col:
+            checked_map[name] = st.checkbox(f"{emoji} {name}", value=False)
+
+    st.markdown("---")
+
+    mood = st.slider("🙂 오늘 기분은 어때요?", min_value=1, max_value=10, value=7, step=1)
+
+with colB:
+    st.markdown("#### 🌍 환경 설정")
+
+    city = st.selectbox("도시 선택", CITY_LIST, index=0)
+
+    coach_style = st.radio(
+        "코치 스타일",
+        COACH_STYLES,
+        index=1,
+        horizontal=False,
+    )
+
+    st.markdown("---")
+    st.info("체크인 후 아래에서 **컨디션 리포트 생성**을 눌러보세요!")
+
+
+# =========================
+# 달성률 계산 + 메트릭
+# =========================
+checked_habits = [h for h in checked_map if checked_map[h]]
+missed_habits = [h for h in checked_map if not checked_map[h]]
+checked_count = len(checked_habits)
+achievement_pct = safe_pct(checked_count, len(HABITS))
+
+st.markdown("---")
+st.subheader("📈 오늘의 달성률")
+
+m1, m2, m3 = st.columns(3, gap="medium")
+with m1:
+    st.metric("달성률", f"{achievement_pct}%")
+with m2:
+    st.metric("달성 습관", f"{checked_count}/5")
+with m3:
+    st.metric("기분", f"{mood}/10")
+
+
+# =========================
+# 기록 저장 (session_state)
+# =========================
+def save_today():
+    today = datetime.now().date().isoformat()
+
+    # 오늘 기록이 이미 있으면 업데이트
+    found = False
+    for row in st.session_state.history:
+        if row["date"] == today:
+            row["pct"] = achievement_pct
+            row["mood"] = mood
+            row["checked_count"] = checked_count
+            found = True
+            break
+
+    if not found:
+        st.session_state.history.append(
+            {
+                "date": today,
+                "pct": achievement_pct,
+                "mood": mood,
+                "checked_count": checked_count,
             }
         )
 
-    df = pd.DataFrame(rows).sort_values(by="streak(일)", ascending=False)
-    st.markdown("### 🧾 습관별 상태")
-    st.dataframe(df, use_container_width=True)
-
-    st.divider()
-
-    # TOP / BOTTOM 3
-    df_rate = pd.DataFrame(
-        [{"habit": h["name"], "rate": habit_success_rate_7days(logs, h["id"])} for h in habits]
-    ).sort_values(by="rate", ascending=False)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("### 🥇 잘 되는 습관 TOP3")
-        top3 = df_rate.head(3)
-        for _, r in top3.iterrows():
-            st.write(f"- {r['habit']} ({int(r['rate']*100)}%)")
-
-    with col2:
-        st.markdown("### 🧱 어려운 습관 TOP3")
-        bottom3 = df_rate.tail(3).sort_values(by="rate", ascending=True)
-        for _, r in bottom3.iterrows():
-            st.write(f"- {r['habit']} ({int(r['rate']*100)}%)")
+    # 날짜 순 정렬 + 최근 7개만 유지
+    st.session_state.history = sorted(st.session_state.history, key=lambda x: x["date"])[-7:]
+    st.session_state.today_saved = True
 
 
-# ---------------------------
-# 페이지: 습관 관리
-# ---------------------------
-def page_manage_habits(habits):
-    st.subheader("➕ 습관 관리")
+# =========================
+# 7일 바 차트 (샘플 6일 + 오늘)
+# =========================
+st.subheader("🗓️ 최근 7일 달성률")
 
-    st.markdown("### ✍️ 새 습관 추가")
-    with st.form("add_habit_form"):
-        name = st.text_input("습관 이름", placeholder="예: 물 2L 마시기")
-        desc = st.text_area("설명 (선택)", placeholder="예: 하루 동안 물병 2번 비우기")
-        category = st.selectbox("카테고리", ["건강", "공부", "운동", "마음", "생활", "기타"])
-        target_per_week = st.slider("주 목표 횟수", 1, 7, 5)
-        start_date = st.date_input("시작일", value=date.today())
+# 오늘 데이터 저장(차트 반영용)
+save_today()
 
-        submitted = st.form_submit_button("추가하기")
+# 차트 데이터 만들기
+chart_rows = []
+for row in st.session_state.history:
+    # 날짜를 보기 좋게
+    try:
+        dt = datetime.fromisoformat(row["date"]).strftime("%m/%d")
+    except Exception:
+        dt = row["date"]
+    chart_rows.append({"날짜": dt, "달성률(%)": row["pct"]})
 
-        if submitted:
-            if not name.strip():
-                st.warning("습관 이름은 필수야!")
-            else:
-                habits.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "name": name.strip(),
-                        "desc": desc.strip(),
-                        "category": category,
-                        "target_per_week": target_per_week,
-                        "start_date": start_date.isoformat(),
-                    }
-                )
-                save_habits(habits)
-                st.success("습관이 추가됐어! 🎉 새로고침하면 목록에 보여.")
-
-    st.divider()
-
-    st.markdown("### 📋 현재 습관 목록")
-    if len(habits) == 0:
-        st.info("아직 습관이 없어요.")
-        return
-
-    # 습관 리스트 표시 + 삭제
-    for h in habits:
-        with st.container(border=True):
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"**{h['name']}**  ·  {h.get('category','기타')}")
-                if h.get("desc"):
-                    st.caption(h["desc"])
-                st.caption(f"주 {h.get('target_per_week', 5)}회 목표 · 시작일 {h.get('start_date')}")
-
-            with c2:
-                if st.button("🗑️ 삭제", key=f"del_{h['id']}", use_container_width=True):
-                    habits = [x for x in habits if x["id"] != h["id"]]
-                    save_habits(habits)
-                    st.success("삭제 완료! 새로고침하면 반영돼요.")
-
-    st.info("※ 수정 기능은 다음 버전에서 추가 가능! (원하면 바로 넣어줄게)")
+st.bar_chart(chart_rows, x="날짜", y="달성률(%)", height=260)
 
 
-# ---------------------------
-# 페이지: 설정
-# ---------------------------
-def page_settings(settings):
-    st.subheader("⚙️ 설정")
+# =========================
+# 결과 표시: 버튼 + 카드 + 리포트
+# =========================
+st.markdown("---")
+st.subheader("🧠 AI 코치 리포트")
 
-    st.markdown("### 🔑 API 키 상태")
+btn_col1, btn_col2 = st.columns([1, 2], gap="large")
+with btn_col1:
+    generate_btn = st.button("🚀 컨디션 리포트 생성", type="primary", use_container_width=True)
 
-    openai_key = os.getenv("OPENAI_API_KEY")
-    weather_key = os.getenv("OPENWEATHER_API_KEY")
-
-    st.write(f"- OPENAI_API_KEY: {'✅ 설정됨' if openai_key else '❌ 없음'}")
-    st.write(f"- OPENWEATHER_API_KEY: {'✅ 설정됨' if weather_key else '❌ 없음'}")
-
-    st.divider()
-
-    st.markdown("### 🏙️ 도시 / 코치 톤")
-    st.write(f"- 도시: **{settings.get('city', 'Seoul')}**")
-    st.write(f"- 코치 톤: **{settings.get('coach_tone', '다정한 코치')}**")
-
-    st.divider()
-
-    st.markdown("### 🧠 참고")
-    st.info(
-        """
-- OpenAI 키가 없으면 AI 코치 기능이 동작하지 않습니다.
-- OpenWeatherMap 키가 없으면 날씨 기반 추천이 동작하지 않습니다.
-- Dog API는 키 없이 무료로 사용됩니다.
-"""
+with btn_col2:
+    st.caption(
+        "※ OpenAI 키가 없으면 리포트 생성이 안 돼요. "
+        "날씨 키가 없으면 날씨는 생략돼요."
     )
 
+if generate_btn:
+    with st.spinner("날씨와 강아지를 불러오고, AI가 리포트를 작성 중..."):
+        # 날씨
+        weather = get_weather(city, weather_api_key)
+        st.session_state.last_weather = weather
 
-# ---------------------------
-# 메인 실행
-# ---------------------------
-def main():
-    render_header()
+        # 강아지
+        dog = get_dog_image()
+        st.session_state.last_dog = dog
 
-    habits = load_habits()
-    logs = load_logs()
-    settings = load_settings()
+        # 리포트
+        report = generate_report(
+            openai_api_key=openai_api_key,
+            coach_style=coach_style,
+            habits_checked=checked_habits,
+            habits_missed=missed_habits,
+            mood=mood,
+            achievement_pct=achievement_pct,
+            weather=weather,
+            dog=dog,
+        )
+        st.session_state.last_report = report
 
-    page = sidebar(settings)
+# 출력 영역
+weather = st.session_state.last_weather
+dog = st.session_state.last_dog
+report = st.session_state.last_report
 
-    if page == "🏠 홈":
-        page_home(habits, logs, settings)
-    elif page == "✅ 오늘 체크":
-        page_daily_checkin(habits, logs, settings)
-    elif page == "📊 통계":
-        page_stats(habits, logs)
-    elif page == "➕ 습관 관리":
-        page_manage_habits(habits)
-    elif page == "⚙️ 설정":
-        page_settings(settings)
+if report or weather or dog:
+    c1, c2 = st.columns(2, gap="large")
+
+    with c1:
+        st.markdown("#### 🌦️ 오늘의 날씨")
+        if weather:
+            st.write(f"**도시:** {weather['city']}")
+            st.write(f"**날씨:** {weather['description']}")
+            st.write(f"**기온:** {weather['temp_c']:.1f}°C (체감 {weather['feels_like_c']:.1f}°C)")
+            st.write(f"**습도:** {weather['humidity']}%")
+            if weather.get("wind_mps") is not None:
+                st.write(f"**바람:** {weather['wind_mps']} m/s")
+        else:
+            st.warning("날씨 정보를 가져오지 못했어요. (API Key 또는 네트워크 확인)")
+
+    with c2:
+        st.markdown("#### 🐶 오늘의 강아지")
+        if dog:
+            st.write(f"**품종(추정):** {dog.get('breed', 'unknown')}")
+            st.image(dog["image_url"], use_container_width=True)
+        else:
+            st.warning("강아지 이미지를 가져오지 못했어요. (네트워크 확인)")
+
+    st.markdown("---")
+    st.markdown("#### 📝 AI 코치 리포트")
+
+    if report:
+        st.markdown(report)
+    else:
+        st.error("AI 리포트를 생성하지 못했어요. (OpenAI API Key 확인)")
 
 
-if __name__ == "__main__":
-    main()
+# =========================
+# 공유용 텍스트
+# =========================
+if report:
+    share_text = f"""
+[AI 습관 트래커 공유]
+
+- 날짜: {datetime.now().date().isoformat()}
+- 도시: {city}
+- 코치: {coach_style}
+- 달성률: {achievement_pct}%
+- 달성: {", ".join(checked_habits) if checked_habits else "없음"}
+- 미달성: {", ".join(missed_habits) if missed_habits else "없음"}
+- 기분: {mood}/10
+
+--- AI 리포트 ---
+{report}
+""".strip()
+
+    st.markdown("---")
+    st.subheader("📤 공유용 텍스트")
+    st.code(share_text, language="text")
+
+
+# =========================
+# 하단: API 안내
+# =========================
+st.markdown("---")
+with st.expander("📌 API 안내 / 설정 방법"):
+    st.markdown(
+        """
+**1) OpenAI API Key**
+- AI 코치 리포트 생성에 필요합니다.
+- OpenAI 대시보드에서 발급한 키를 사용하세요.
+
+**2) OpenWeatherMap API Key**
+- 현재 날씨 정보를 가져오는데 필요합니다.
+- https://openweathermap.org/ 에서 가입 후 API Key를 발급받을 수 있어요.
+
+**3) Dog CEO API**
+- 무료 공개 API라 키가 필요 없습니다.
+- 네트워크 상황에 따라 실패할 수 있습니다.
+
+**문제 해결**
+- 리포트가 안 나오면: OpenAI Key 확인
+- 날씨가 안 나오면: OpenWeatherMap Key 확인 + 도시명(영문) 확인
+- 강아지가 안 나오면: 잠깐 후 다시 시도
+        """.strip()
+    )
