@@ -1,7 +1,4 @@
 # app.py
-import os
-import json
-import time
 import random
 from datetime import datetime, timedelta
 
@@ -47,29 +44,39 @@ def _timeout_get(url, params=None, headers=None, timeout=10):
 # =========================
 # API 연동 함수
 # =========================
-def get_weather(city: str, api_key: str):
+def get_weather(city: str, api_key: str, debug: bool = False):
     """
     OpenWeatherMap 현재 날씨 조회.
     - 한국어
     - 섭씨
     실패 시 None 반환
     """
+
+    api_key = (api_key or "").strip()
     if not api_key:
         return None
 
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
-        "q": city,
+        "q": city,  # 예: "Seoul,KR"
         "appid": api_key,
         "units": "metric",
         "lang": "kr",
     }
 
-    data = _timeout_get(url, params=params, timeout=10)
-    if not data:
-        return None
-
     try:
+        r = requests.get(url, params=params, timeout=10)
+
+        # 디버그 모드면 사이드바에 원인 표시
+        if debug:
+            st.sidebar.write("🌦️ OpenWeather 응답 코드:", r.status_code)
+            st.sidebar.write("🌦️ OpenWeather 응답 본문(일부):", r.text[:300])
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
         weather_desc = data["weather"][0]["description"]
         temp = data["main"]["temp"]
         feels_like = data["main"]["feels_like"]
@@ -84,6 +91,7 @@ def get_weather(city: str, api_key: str):
             "humidity": int(humidity),
             "wind_mps": wind,
         }
+
     except Exception:
         return None
 
@@ -100,13 +108,13 @@ def get_dog_image():
 
     try:
         image_url = data["message"]
+
         # 예: https://images.dog.ceo/breeds/hound-afghan/n02088094_1003.jpg
-        # 품종 추출: breeds/다음 폴더명
         breed = "unknown"
         if "/breeds/" in image_url:
             part = image_url.split("/breeds/")[1].split("/")[0]
-            # hound-afghan 같은 케이스
             breed = part.replace("-", " ")
+
         return {"image_url": image_url, "breed": breed}
     except Exception:
         return None
@@ -148,6 +156,7 @@ OUTPUT_FORMAT_GUIDE = """
 - 한 문장
 """
 
+
 def generate_report(
     openai_api_key: str,
     coach_style: str,
@@ -163,6 +172,7 @@ def generate_report(
     모델: gpt-5-mini
     실패 시 None 반환
     """
+    openai_api_key = (openai_api_key or "").strip()
     if not openai_api_key:
         return None
 
@@ -244,6 +254,8 @@ with st.sidebar:
         help="날씨 정보를 가져올 때 필요해요.",
     )
 
+    debug_weather = st.toggle("날씨 디버그 보기", value=False)
+
     st.divider()
     st.caption("⚙️ 팁: 키가 없으면 앱은 동작하지만, 날씨/AI 리포트는 제한돼요.")
 
@@ -259,23 +271,24 @@ HABITS = [
     ("😴", "수면"),
 ]
 
+# 🔥 핵심 수정: 도시를 "도시,KR" 형태로
 CITY_LIST = [
-    "Seoul",
-    "Busan",
-    "Incheon",
-    "Daegu",
-    "Daejeon",
-    "Gwangju",
-    "Suwon",
-    "Ulsan",
-    "Jeju",
-    "Changwon",
+    "Seoul,KR",
+    "Busan,KR",
+    "Incheon,KR",
+    "Daegu,KR",
+    "Daejeon,KR",
+    "Gwangju,KR",
+    "Suwon,KR",
+    "Ulsan,KR",
+    "Jeju,KR",
+    "Changwon,KR",
 ]
 
 COACH_STYLES = ["스파르타 코치", "따뜻한 멘토", "게임 마스터"]
 
 if "history" not in st.session_state:
-    st.session_state.history = []  # list of dict: {date, pct, mood, checked_count}
+    st.session_state.history = []
 
 if "today_saved" not in st.session_state:
     st.session_state.today_saved = False
@@ -297,7 +310,6 @@ def init_demo_history_if_empty():
     if st.session_state.history:
         return
 
-    # 최근 6일 샘플
     today = datetime.now().date()
     base = today - timedelta(days=6)
 
@@ -331,10 +343,8 @@ colA, colB = st.columns([1.2, 1.0], gap="large")
 with colA:
     st.markdown("#### 🧾 습관 체크")
 
-    # 2열 배치
     left, right = st.columns(2, gap="medium")
 
-    # 체크 상태 저장용 dict
     checked_map = {}
 
     for idx, (emoji, name) in enumerate(HABITS):
@@ -343,20 +353,13 @@ with colA:
             checked_map[name] = st.checkbox(f"{emoji} {name}", value=False)
 
     st.markdown("---")
-
     mood = st.slider("🙂 오늘 기분은 어때요?", min_value=1, max_value=10, value=7, step=1)
 
 with colB:
     st.markdown("#### 🌍 환경 설정")
 
     city = st.selectbox("도시 선택", CITY_LIST, index=0)
-
-    coach_style = st.radio(
-        "코치 스타일",
-        COACH_STYLES,
-        index=1,
-        horizontal=False,
-    )
+    coach_style = st.radio("코치 스타일", COACH_STYLES, index=1, horizontal=False)
 
     st.markdown("---")
     st.info("체크인 후 아래에서 **컨디션 리포트 생성**을 눌러보세요!")
@@ -388,7 +391,6 @@ with m3:
 def save_today():
     today = datetime.now().date().isoformat()
 
-    # 오늘 기록이 이미 있으면 업데이트
     found = False
     for row in st.session_state.history:
         if row["date"] == today:
@@ -408,23 +410,21 @@ def save_today():
             }
         )
 
-    # 날짜 순 정렬 + 최근 7개만 유지
     st.session_state.history = sorted(st.session_state.history, key=lambda x: x["date"])[-7:]
     st.session_state.today_saved = True
 
 
+# 차트 반영용으로 오늘 데이터 저장
+save_today()
+
+
 # =========================
-# 7일 바 차트 (샘플 6일 + 오늘)
+# 7일 바 차트
 # =========================
 st.subheader("🗓️ 최근 7일 달성률")
 
-# 오늘 데이터 저장(차트 반영용)
-save_today()
-
-# 차트 데이터 만들기
 chart_rows = []
 for row in st.session_state.history:
-    # 날짜를 보기 좋게
     try:
         dt = datetime.fromisoformat(row["date"]).strftime("%m/%d")
     except Exception:
@@ -445,15 +445,14 @@ with btn_col1:
     generate_btn = st.button("🚀 컨디션 리포트 생성", type="primary", use_container_width=True)
 
 with btn_col2:
-    st.caption(
-        "※ OpenAI 키가 없으면 리포트 생성이 안 돼요. "
-        "날씨 키가 없으면 날씨는 생략돼요."
-    )
+    st.caption("※ OpenAI 키가 없으면 리포트 생성이 안 돼요. 날씨 키가 없으면 날씨는 생략돼요.")
+
 
 if generate_btn:
     with st.spinner("날씨와 강아지를 불러오고, AI가 리포트를 작성 중..."):
+
         # 날씨
-        weather = get_weather(city, weather_api_key)
+        weather = get_weather(city, weather_api_key, debug=debug_weather)
         st.session_state.last_weather = weather
 
         # 강아지
@@ -472,6 +471,7 @@ if generate_btn:
             dog=dog,
         )
         st.session_state.last_report = report
+
 
 # 출력 영역
 weather = st.session_state.last_weather
@@ -548,6 +548,7 @@ with st.expander("📌 API 안내 / 설정 방법"):
 **2) OpenWeatherMap API Key**
 - 현재 날씨 정보를 가져오는데 필요합니다.
 - https://openweathermap.org/ 에서 가입 후 API Key를 발급받을 수 있어요.
+- 도시 검색이 불안정할 수 있어 **Seoul,KR** 형태로 보내는 것이 가장 안정적입니다.
 
 **3) Dog CEO API**
 - 무료 공개 API라 키가 필요 없습니다.
@@ -555,7 +556,10 @@ with st.expander("📌 API 안내 / 설정 방법"):
 
 **문제 해결**
 - 리포트가 안 나오면: OpenAI Key 확인
-- 날씨가 안 나오면: OpenWeatherMap Key 확인 + 도시명(영문) 확인
+- 날씨가 안 나오면:
+  - OpenWeatherMap Key 확인
+  - 도시가 "Seoul,KR" 형태인지 확인
+  - 사이드바의 "날씨 디버그 보기"를 켜고 401/404/429 확인
 - 강아지가 안 나오면: 잠깐 후 다시 시도
         """.strip()
     )
