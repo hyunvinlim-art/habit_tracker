@@ -1,5 +1,7 @@
 # app.py
 import random
+import json
+import calendar
 from datetime import datetime, timedelta
 
 import requests
@@ -156,6 +158,99 @@ OUTPUT_FORMAT_GUIDE = """
 - 한 문장
 """
 
+HABIT_CATEGORIES = {
+    "기본 루틴": ["기상 미션", "물 마시기", "공부/독서", "운동하기", "수면"],
+    "운동": ["30분 걷기", "스트레칭 10분", "가벼운 근력운동"],
+    "마음건강": ["감정 기록 3줄", "심호흡 5분", "디지털 디톡스 30분"],
+    "영양": ["단백질 포함 식사", "야식 줄이기", "채소 한 접시"],
+}
+
+
+def heuristic_recommendation(goal: str, health_traits: str):
+    trait_text = f"{goal} {health_traits}".lower()
+    rec = {
+        "운동": ["30분 걷기", "스트레칭 10분"],
+        "마음건강": ["감정 기록 3줄"],
+        "영양": ["단백질 포함 식사"],
+    }
+    if "체중" in trait_text or "다이어트" in trait_text:
+        rec["운동"].append("가벼운 근력운동")
+        rec["영양"].append("야식 줄이기")
+    if "혈압" in trait_text or "당" in trait_text:
+        rec["영양"].append("채소 한 접시")
+    if "불면" in trait_text or "스트레스" in trait_text:
+        rec["마음건강"].append("심호흡 5분")
+        rec["마음건강"].append("디지털 디톡스 30분")
+
+    return {k: sorted(set(v)) for k, v in rec.items()}
+
+
+def generate_habit_recommendations(openai_api_key: str, goal: str, health_traits: str):
+    openai_api_key = (openai_api_key or "").strip()
+    if not openai_api_key:
+        return heuristic_recommendation(goal, health_traits)
+
+    prompt = f"""
+사용자 목표: {goal}
+건강 특징: {health_traits}
+
+조건:
+- 습관을 '운동', '영양', '마음건강' 3개 카테고리로 나눠라.
+- 각 카테고리마다 체크리스트 항목 2개씩 제시하라.
+- 각 항목은 20자 이내로 짧게 작성하라.
+- 반드시 아래 JSON 형식만 출력하라.
+
+{{
+  "운동": ["...", "..."],
+  "영양": ["...", "..."],
+  "마음건강": ["...", "..."]
+}}
+""".strip()
+
+    try:
+        client = OpenAI(api_key=openai_api_key)
+        res = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": "너는 습관 설계 코치다. JSON만 출력한다."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        raw = res.choices[0].message.content.strip()
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            cleaned = {}
+            for k in ["운동", "영양", "마음건강"]:
+                values = data.get(k, [])
+                if isinstance(values, list):
+                    cleaned[k] = [str(x)[:20] for x in values][:3]
+            if cleaned:
+                return cleaned
+    except Exception:
+        pass
+
+    return heuristic_recommendation(goal, health_traits)
+
+
+def build_month_calendar(selected_date, history_rows):
+    history_by_date = {row["date"]: row.get("pct", 0) for row in history_rows}
+    year, month = selected_date.year, selected_date.month
+    cal = calendar.monthcalendar(year, month)
+    table = []
+    for week in cal:
+        row = {}
+        for idx, d in enumerate(week):
+            key = ["월", "화", "수", "목", "금", "토", "일"][idx]
+            if d == 0:
+                row[key] = ""
+            else:
+                date_key = datetime(year, month, d).date().isoformat()
+                pct = history_by_date.get(date_key)
+                row[key] = f"{d}\n({pct}%)" if pct is not None else str(d)
+        table.append(row)
+    return table
+
 
 def generate_report(
     openai_api_key: str,
@@ -302,6 +397,12 @@ if "last_weather" not in st.session_state:
 if "last_dog" not in st.session_state:
     st.session_state.last_dog = None
 
+if "recommended_by_category" not in st.session_state:
+    st.session_state.recommended_by_category = {}
+
+if "daily_checklists" not in st.session_state:
+    st.session_state.daily_checklists = {}
+
 
 # =========================
 # 데모용 6일 샘플 데이터 (초기 1회만)
@@ -338,6 +439,13 @@ init_demo_history_if_empty()
 # =========================
 st.subheader("✅ 오늘의 습관 체크인")
 
+selected_date = st.date_input("📅 체크할 날짜", value=datetime.now().date())
+selected_date_str = selected_date.isoformat()
+
+calendar_rows = build_month_calendar(selected_date, st.session_state.history)
+st.markdown("#### 🗓️ 달력 인터페이스")
+st.table(calendar_rows)
+
 colA, colB = st.columns([1.2, 1.0], gap="large")
 
 with colA:
@@ -345,12 +453,24 @@ with colA:
 
     left, right = st.columns(2, gap="medium")
 
-    checked_map = {}
+    default_habits = [name for _, name in HABITS]
+    recommended_flat = []
+    for category, items in st.session_state.recommended_by_category.items():
+        recommended_flat.extend([f"{category} | {item}" for item in items])
 
-    for idx, (emoji, name) in enumerate(HABITS):
+    if selected_date_str not in st.session_state.daily_checklists:
+        base = {name: False for name in default_habits + recommended_flat}
+        st.session_state.daily_checklists[selected_date_str] = base
+
+    checked_map = st.session_state.daily_checklists[selected_date_str]
+    habit_items = list(checked_map.keys())
+
+    for idx, name in enumerate(habit_items):
         target_col = left if idx % 2 == 0 else right
         with target_col:
-            checked_map[name] = st.checkbox(f"{emoji} {name}", value=False)
+            emoji = "✅" if "|" in name else "🧾"
+            checkbox_key = f"check_{selected_date_str}_{idx}_{name}"
+            checked_map[name] = st.checkbox(f"{emoji} {name}", value=checked_map[name], key=checkbox_key)
 
     st.markdown("---")
     mood = st.slider("🙂 오늘 기분은 어때요?", min_value=1, max_value=10, value=7, step=1)
@@ -364,6 +484,33 @@ with colB:
     st.markdown("---")
     st.info("체크인 후 아래에서 **컨디션 리포트 생성**을 눌러보세요!")
 
+    st.markdown("---")
+    st.markdown("#### 🤖 습관 추천 챗봇")
+    st.chat_message("assistant").write("무엇을 이루고 싶나요? 목표를 입력해 주세요.")
+    goal_input = st.text_input("목표", placeholder="예: 3개월 동안 체지방 감량하고 싶어요")
+    st.chat_message("assistant").write("건강상의 특징이나 주의할 점을 알려주세요.")
+    health_traits_input = st.text_area("건강 특징", placeholder="예: 무릎 통증, 수면이 불규칙함")
+
+    if st.button("추천 습관 생성", use_container_width=True):
+        if goal_input.strip():
+            st.session_state.recommended_by_category = generate_habit_recommendations(
+                openai_api_key=openai_api_key,
+                goal=goal_input,
+                health_traits=health_traits_input,
+            )
+            st.success("추천 습관이 생성되었습니다. 날짜별 체크리스트에 반영됩니다.")
+        else:
+            st.warning("목표를 먼저 입력해 주세요.")
+
+if st.session_state.recommended_by_category:
+    st.markdown("#### 🧩 추천 습관 종류별 보기")
+    cate_cols = st.columns(3)
+    for i, (category, items) in enumerate(st.session_state.recommended_by_category.items()):
+        with cate_cols[i % 3]:
+            st.markdown(f"**{category}**")
+            for item in items:
+                st.markdown(f"- {item}")
+
 
 # =========================
 # 달성률 계산 + 메트릭
@@ -371,7 +518,7 @@ with colB:
 checked_habits = [h for h in checked_map if checked_map[h]]
 missed_habits = [h for h in checked_map if not checked_map[h]]
 checked_count = len(checked_habits)
-achievement_pct = safe_pct(checked_count, len(HABITS))
+achievement_pct = safe_pct(checked_count, len(checked_map))
 
 st.markdown("---")
 st.subheader("📈 오늘의 달성률")
@@ -380,7 +527,7 @@ m1, m2, m3 = st.columns(3, gap="medium")
 with m1:
     st.metric("달성률", f"{achievement_pct}%")
 with m2:
-    st.metric("달성 습관", f"{checked_count}/5")
+    st.metric("달성 습관", f"{checked_count}/{len(checked_map)}")
 with m3:
     st.metric("기분", f"{mood}/10")
 
@@ -388,12 +535,11 @@ with m3:
 # =========================
 # 기록 저장 (session_state)
 # =========================
-def save_today():
-    today = datetime.now().date().isoformat()
+def save_day(day_str):
 
     found = False
     for row in st.session_state.history:
-        if row["date"] == today:
+        if row["date"] == day_str:
             row["pct"] = achievement_pct
             row["mood"] = mood
             row["checked_count"] = checked_count
@@ -403,7 +549,7 @@ def save_today():
     if not found:
         st.session_state.history.append(
             {
-                "date": today,
+                "date": day_str,
                 "pct": achievement_pct,
                 "mood": mood,
                 "checked_count": checked_count,
@@ -415,7 +561,7 @@ def save_today():
 
 
 # 차트 반영용으로 오늘 데이터 저장
-save_today()
+save_day(selected_date_str)
 
 
 # =========================
